@@ -9,7 +9,7 @@ app = FastAPI(title="Tamil Next Word Prediction API")
 # Allow CORS for Frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For local dev, allow all. stricter in prod.
+    allow_origins=["http://localhost:3000", "https://yourdomain.com"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -28,9 +28,23 @@ def health_check():
 async def predict(request: PredictionRequest):
     start_time = time.time()
     
-    sentence = request.current_sentence
-    language = request.language
-    partial_word = request.partial_word
+    sentence = request.current_sentence.strip()
+    language = request.language.lower()
+    partial_word = request.partial_word.strip()
+    
+    # Input validation
+    if not sentence:
+        raise HTTPException(status_code=400, detail="Input sentence cannot be empty")
+    
+    if len(sentence) > 100:
+        raise HTTPException(status_code=400, detail="Input sentence exceeds maximum length of 100 characters")
+    
+    if language not in ['tamil', 'en', 'ta']:
+        raise HTTPException(status_code=400, detail="Language must be 'tamil', 'ta', or 'en'")
+    
+    # Normalize language code
+    language = 'ta' if language in ['tamil', 'ta'] else 'en'
+    
     print(f"Received prediction request for: {sentence} (Language: {language}, Partial: '{partial_word}')")
     
     try:

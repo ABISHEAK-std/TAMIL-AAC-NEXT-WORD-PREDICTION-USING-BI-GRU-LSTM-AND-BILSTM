@@ -27,6 +27,8 @@ function App() {
 
   /* Debounced Auto-Prediction Logic */
   const [loading, setLoading] = useState(false);
+  const abortControllerRef = React.useRef<AbortController | null>(null);
+  
   React.useEffect(() => {
     if (!started || !sentence.trim()) return;
 
@@ -85,6 +87,16 @@ function App() {
 
   const fetchPredictions = async (currentText: string) => {
     setLoading(true);
+    
+    // Cancel previous request if it's still in flight
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    
+    // Create new AbortController for this request
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+    
     try {
       // Extract the partial word being typed (for prefix filtering)
       // Only use it if prefix mode is enabled
@@ -94,29 +106,41 @@ function App() {
         current_sentence: currentText,
         language: language,
         partial_word: partialWord
+      }, {
+        signal: abortController.signal
       });
-      setResults(res.data.data);
+      
+      // Only process response if this request wasn't aborted
+      if (!abortController.signal.aborted) {
+          setResults(res.data.data);
 
-      // Update Graph Stats
-      const data: PredictionResponse = res.data.data;
-      setStats(prev => ({
-        // For English, bi_gru is unused/empty, but we keep the arrays aligned
-        bi_gru_conf: [...prev.bi_gru_conf, data.bi_gru?.top1_confidence || 0],
-        lstm_conf: [...prev.lstm_conf, data.lstm.top1_confidence],
-        bilstm_conf: [...prev.bilstm_conf, data.bilstm.top1_confidence],
+        // Update Graph Stats
+        const data: PredictionResponse = res.data.data;
+        setStats(prev => ({
+          // For English, bi_gru is unused/empty, but we keep the arrays aligned
+          bi_gru_conf: [...prev.bi_gru_conf, data.bi_gru?.top1_confidence || 0],
+          lstm_conf: [...prev.lstm_conf, data.lstm.top1_confidence],
+          bilstm_conf: [...prev.bilstm_conf, data.bilstm.top1_confidence],
 
-        bi_gru_valid: [...prev.bi_gru_valid, data.bi_gru?.validity_score || 0],
-        lstm_valid: [...prev.lstm_valid, data.lstm.validity_score],
-        bilstm_valid: [...prev.bilstm_valid, data.bilstm.validity_score],
+          bi_gru_valid: [...prev.bi_gru_valid, data.bi_gru?.validity_score || 0],
+          lstm_valid: [...prev.lstm_valid, data.lstm.validity_score],
+          bilstm_valid: [...prev.bilstm_valid, data.bilstm.validity_score],
 
-        labels: [...prev.labels, `Step ${prev.labels.length + 1}`]
-      }));
+          labels: [...prev.labels, `Step ${prev.labels.length + 1}`]
+        }));
+      }
 
     } catch (err) {
-      console.error("Prediction Error:", err);
-      alert("Failed to fetch predictions. Ensure backend is running.");
+      // Only show error if request wasn't aborted
+      if (!abortController.signal.aborted) {
+        console.error("Prediction Error:", err);
+        alert("Failed to fetch predictions. Ensure backend is running.");
+      }
     } finally {
-      setLoading(false);
+      // Only clear loading if this request wasn't aborted
+      if (!abortController.signal.aborted) {
+        setLoading(false);
+      }
     }
   };
 
@@ -221,7 +245,7 @@ function App() {
       // English
       const voices = window.speechSynthesis.getVoices();
       const englishVoice = voices.find(voice =>
-        voice.lang.startsWith('en-US') || voice.lang.startsWith('en-GB')
+        voice.lang.startsWith('en')
       );
 
       if (englishVoice) {
@@ -229,6 +253,7 @@ function App() {
         utterance.lang = englishVoice.lang;
       } else {
         utterance.lang = 'en-US';
+        console.warn('No English voice found. Using default with en-US language code.');
       }
     }
 
@@ -245,6 +270,8 @@ function App() {
 
       if (language === 'ta') {
         alert('Tamil voice not available on this device. Please install Tamil language support in your operating system settings.\n\nWindows: Settings → Time & Language → Language → Add Tamil\nMac: System Preferences → Accessibility → Spoken Content → System Voice → Manage Voices');
+      } else {
+        console.warn('English speech synthesis encountered an error, but will attempt to continue with available voices.');
       }
     };
 

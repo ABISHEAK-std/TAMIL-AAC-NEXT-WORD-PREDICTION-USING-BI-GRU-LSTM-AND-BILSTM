@@ -19,9 +19,9 @@ const ConfidenceGraph: React.FC<ConfidenceGraphProps> = ({ stats }) => {
 
     const data = Array.from({ length: maxLength }).map((_, i) => ({
         step: i + 1,
-        'Direct Tamil Bi-GRU': (stats.bi_gru_conf[i] || 0) * 100,
-        'LSTM Baseline': (stats.lstm_conf[i] || 0) * 100,
-        'BiLSTM Model': (stats.bilstm_conf[i] || 0) * 100,
+        'Direct Tamil Bi-GRU': isNaN(stats.bi_gru_conf[i]) ? 0 : (stats.bi_gru_conf[i] || 0) * 100,
+        'LSTM Baseline': isNaN(stats.lstm_conf[i]) ? 0 : (stats.lstm_conf[i] || 0) * 100,
+        'BiLSTM Model': isNaN(stats.bilstm_conf[i]) ? 0 : (stats.bilstm_conf[i] || 0) * 100,
     }));
 
     if (maxLength === 0) {

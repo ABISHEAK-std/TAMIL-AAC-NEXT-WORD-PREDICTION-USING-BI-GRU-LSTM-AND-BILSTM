@@ -3,6 +3,8 @@ import tensorflow as tf
 import numpy as np
 import pickle
 import torch
+import asyncio
+import functools
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from transformers import MarianMTModel, MarianTokenizer
 
@@ -102,6 +104,22 @@ except Exception as e:
 # HELPER FUNCTIONS
 # ==========================================
 
+def convert_to_serializable(obj):
+    """
+    Convert numpy types to native Python types for JSON serialization.
+    """
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.float32, np.float64)):
+        return float(obj)
+    if isinstance(obj, (np.int32, np.int64)):
+        return int(obj)
+    if isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [convert_to_serializable(item) for item in obj]
+    return obj
+
 def translate_offline(text, direction="ta_en"):
     """
     Translates text using loaded offline Helsinki-NLP models.
@@ -123,6 +141,11 @@ def translate_offline(text, direction="ta_en"):
         with torch.no_grad():
             output = model_en_ta.generate(**inputs)
         return tokenizer_en_ta.batch_decode(output, skip_special_tokens=True)[0]
+
+@functools.lru_cache(maxsize=512)
+def translate_cached(text, direction):
+    """Cached version of translate_offline for frequent predictions."""
+    return translate_offline(text, direction)
 
 
 def filter_predictions_by_prefix(predictions, prefix, top_k=3):
@@ -206,23 +229,51 @@ def predict_english(model, tokenizer, text, top_k=30):
     return results, top1_prob
 
 
+def translate_batch(words, direction="en_ta"):
+    """
+    Batch translate multiple words at once for better performance.
+    """
+    if not words:
+        return []
+    
+    # Filter empty words
+    words = [w for w in words if w and w.strip()]
+    if not words:
+        return []
+    
+    try:
+        if direction == "en_ta":
+            # Batch translate English words to Tamil
+            inputs = tokenizer_en_ta([">>tam<< " + w for w in words], return_tensors="pt", padding=True).to(DEVICE)
+            with torch.no_grad():
+                outputs = model_en_ta.generate(**inputs)
+            return tokenizer_en_ta.batch_decode(outputs, skip_special_tokens=True)
+        else:
+            # Batch translate Tamil to English
+            inputs = tokenizer_ta_en(words, return_tensors="pt", padding=True).to(DEVICE)
+            with torch.no_grad():
+                outputs = model_ta_en.generate(**inputs)
+            return tokenizer_ta_en.batch_decode(outputs, skip_special_tokens=True)
+    except Exception as e:
+        print(f"Batch translation error: {e}")
+        return [translate_offline(w, direction) for w in words]
+
 def translation_pipeline_predict(text_ta, model, tokenizer, top_k=3):
     try:
         # 1. Tamil -> English
-        text_en = translate_offline(text_ta, direction="ta_en")
+        text_en = translate_cached(text_ta, direction="ta_en")
         
         # 2. Predict next English words
         en_preds, top1_prob = predict_english(model, tokenizer, text_en, top_k)
         
+        # 3. Batch English -> Tamil (Translate all predictions at once)
+        en_words = [item["word"] for item in en_preds]
+        ta_words = translate_batch(en_words, direction="en_ta")
         
-        # 3. English -> Tamil (Back translate predictions)
         ta_preds = []
-        for item in en_preds:
-            # en_preds is a list of dicts: {"word": "...", "confidence": ...}
-            en_word = item["word"]
-            prob = item["confidence"]
-            
-            ta_word = translate_offline(en_word, direction="en_ta")
+        for i, en_item in enumerate(en_preds):
+            ta_word = ta_words[i] if i < len(ta_words) else ""
+            prob = en_item["confidence"]
             ta_preds.append({"word": ta_word, "confidence": prob})
             
         return ta_preds, top1_prob
@@ -275,10 +326,13 @@ def is_grammatically_valid(current_sentence, next_word, language="ta"):
     """
     Rule-based validity check for a single next-word prediction.
     """
+    if not current_sentence or not next_word:
+        return False
+    
     sentence_tokens = current_sentence.strip().split()
     if not sentence_tokens:
-        return True # Can't fail if no context
-        
+        return True
+    
     prev_word = sentence_tokens[-1]
     
     if language == "en":
@@ -327,7 +381,6 @@ def is_grammatically_valid(current_sentence, next_word, language="ta"):
     if is_verb(next_word):
         if "நான்" in sentence_tokens:
             if not (next_word.endswith("ேன்") or next_word.endswith("கிறேன்")):
-                # Check specifics to avoid false positives on 'valid' mismatched verbs
                 return False
         if "நாங்கள்" in sentence_tokens or "நாம்" in sentence_tokens:
              if not (next_word.endswith("ோம்") or next_word.endswith("கிறோம்")):
@@ -351,10 +404,87 @@ def calculate_validity_score(predictions, current_sentence, language="ta"):
     return (valid_count / len(predictions)) * 100
 
 
+async def predict_bigru_async(current_sentence, partial_word):
+    """Async wrapper for Bi-GRU prediction."""
+    try:
+        preds, conf = predict_tamil_bigru(current_sentence)
+        filtered_preds = filter_predictions_by_prefix(preds, partial_word, top_k=3)
+        validity = calculate_validity_score(filtered_preds, current_sentence, language="ta")
+        return {
+            "predictions": filtered_preds,
+            "top1_confidence": conf,
+            "validity_score": validity
+        }
+    except Exception as e:
+        print(f"Bi-GRU Error: {e}")
+        return {"predictions": [], "top1_confidence": 0.0, "error": str(e)}
+
+async def predict_lstm_ta_async(current_sentence, partial_word):
+    """Async wrapper for LSTM (Tamil pipeline) prediction."""
+    try:
+        preds, conf = translation_pipeline_predict(current_sentence, lstm_model, en_tokenizer_lstm)
+        filtered_preds = filter_predictions_by_prefix(preds, partial_word, top_k=3)
+        validity = calculate_validity_score(filtered_preds, current_sentence, language="ta")
+        return {
+            "predictions": filtered_preds,
+            "top1_confidence": conf,
+            "validity_score": validity
+        }
+    except Exception as e:
+        print(f"LSTM Error: {e}")
+        return {"predictions": [], "top1_confidence": 0.0, "error": str(e)}
+
+async def predict_bilstm_ta_async(current_sentence, partial_word):
+    """Async wrapper for BiLSTM (Tamil pipeline) prediction."""
+    try:
+        preds, conf = translation_pipeline_predict(current_sentence, bilstm_model, en_tokenizer_bilstm)
+        filtered_preds = filter_predictions_by_prefix(preds, partial_word, top_k=3)
+        validity = calculate_validity_score(filtered_preds, current_sentence, language="ta")
+        return {
+            "predictions": filtered_preds,
+            "top1_confidence": conf,
+            "validity_score": validity
+        }
+    except Exception as e:
+        print(f"BiLSTM Error: {e}")
+        return {"predictions": [], "top1_confidence": 0.0, "error": str(e)}
+
+async def predict_lstm_en_async(current_sentence, partial_word):
+    """Async wrapper for LSTM (English) prediction."""
+    try:
+        preds, conf = predict_english(lstm_model, en_tokenizer_lstm, current_sentence)
+        filtered_preds = filter_predictions_by_prefix(preds, partial_word, top_k=3)
+        validity = calculate_validity_score(filtered_preds, current_sentence, language="en")
+        return {
+            "predictions": filtered_preds,
+            "top1_confidence": conf,
+            "validity_score": validity
+        }
+    except Exception as e:
+        print(f"LSTM Error: {e}")
+        return {"predictions": [], "top1_confidence": 0.0, "error": str(e)}
+
+async def predict_bilstm_en_async(current_sentence, partial_word):
+    """Async wrapper for BiLSTM (English) prediction."""
+    try:
+        preds, conf = predict_english(bilstm_model, en_tokenizer_bilstm, current_sentence)
+        filtered_preds = filter_predictions_by_prefix(preds, partial_word, top_k=3)
+        validity = calculate_validity_score(filtered_preds, current_sentence, language="en")
+        return {
+            "predictions": filtered_preds,
+            "top1_confidence": conf,
+            "validity_score": validity
+        }
+    except Exception as e:
+        print(f"BiLSTM Error: {e}")
+        return {"predictions": [], "top1_confidence": 0.0, "error": str(e)}
+
+
 def get_predictions(current_sentence, language="ta", partial_word=""):
     """
     Main entry point for API.
     Returns dictionary with predictions for all 3 models.
+    Runs model inference in parallel for better performance.
     
     Args:
         current_sentence: The complete sentence context
@@ -447,7 +577,7 @@ def get_predictions(current_sentence, language="ta", partial_word=""):
             print(f"BiLSTM Error: {e}")
             response["bilstm"] = {"predictions": [], "top1_confidence": 0.0, "error": str(e)}
 
-    return response
+    return convert_to_serializable(response)
 
 if __name__ == "__main__":
     # Simple Test

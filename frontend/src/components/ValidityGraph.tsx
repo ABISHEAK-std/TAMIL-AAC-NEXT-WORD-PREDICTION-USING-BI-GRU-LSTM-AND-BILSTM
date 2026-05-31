@@ -15,9 +15,9 @@ const ValidityGraph: React.FC<ValidityGraphProps> = ({ stats }) => {
 
     const data = Array.from({ length: maxLength }).map((_, i) => ({
         step: i + 1,
-        'Direct Tamil Bi-GRU': stats.bi_gru_valid[i] || 0,
-        'LSTM Baseline': stats.lstm_valid[i] || 0,
-        'BiLSTM Model': stats.bilstm_valid[i] || 0,
+        'Direct Tamil Bi-GRU': isNaN(stats.bi_gru_valid[i]) ? 0 : (stats.bi_gru_valid[i] || 0),
+        'LSTM Baseline': isNaN(stats.lstm_valid[i]) ? 0 : (stats.lstm_valid[i] || 0),
+        'BiLSTM Model': isNaN(stats.bilstm_valid[i]) ? 0 : (stats.bilstm_valid[i] || 0),
     }));
 
     if (maxLength === 0) {
