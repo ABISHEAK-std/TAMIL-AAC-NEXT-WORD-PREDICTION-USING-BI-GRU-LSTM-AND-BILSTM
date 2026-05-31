@@ -15,13 +15,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(BASE_DIR)  # e:\CCP2_TAMtoENG_AAC\tamil_next_word_app\new ui
 
 # Model filenames
-BI_GRU_PATH = os.path.join(PROJECT_ROOT, "bi_gru_1111.keras")
+BI_GRU_PATH = os.path.join(PROJECT_ROOT, "bi_gru_1500.keras")
 LSTM_PATH = os.path.join(PROJECT_ROOT, "baseline_lstm_glove.keras")
 BILSTM_PATH = os.path.join(PROJECT_ROOT, "bilstm_glove_finetuned.keras")
 
 # Tokenizer filenames
-WORD2IDX_PATH = os.path.join(PROJECT_ROOT, "word2idxlarge.pkl")
-IDX2WORD_PATH = os.path.join(PROJECT_ROOT, "idx2wordlarge.pkl")
+WORD2IDX_PATH = os.path.join(PROJECT_ROOT, "word2idx1500.pkl")
+IDX2WORD_PATH = os.path.join(PROJECT_ROOT, "idx2word1500.pkl")
 TOKENIZER_LSTM_PATH = os.path.join(PROJECT_ROOT, "tokenizer_baseline.pkl")
 TOKENIZER_BILSTM_PATH = os.path.join(PROJECT_ROOT, "tokenizer_bilstm_glove.pkl")
 
@@ -70,17 +70,32 @@ except Exception as e:
     raise e
 
 # 3. Load Translation Models (Offline)
+# 3. Load Translation Models
 try:
+    print("Trying to load NMT models locally...")
     tokenizer_ta_en = MarianTokenizer.from_pretrained(TA_EN_DIR, local_files_only=True)
     model_ta_en = MarianMTModel.from_pretrained(TA_EN_DIR, local_files_only=True).to(DEVICE)
 
     tokenizer_en_ta = MarianTokenizer.from_pretrained(EN_TA_DIR, local_files_only=True)
     model_en_ta = MarianMTModel.from_pretrained(EN_TA_DIR, local_files_only=True).to(DEVICE)
-    print("✅ NMT Models loaded.")
+    print("✅ NMT Models loaded from local directory.")
 except Exception as e:
-    print(f"❌ Error loading NMT models: {e}")
-    # We might want to continue if NMT fails, but for this app it's critical
-    raise e
+    print(f"⚠️ Local NMT load failed ({e}). Attempting download from Hugging Face Hub...")
+    try:
+        # Fallback to Helsinki-NLP official models
+        # Tamil -> English (Dravidian -> English)
+        TA_EN_MODEL_ID = "Helsinki-NLP/opus-mt-dra-en"
+        tokenizer_ta_en = MarianTokenizer.from_pretrained(TA_EN_MODEL_ID)
+        model_ta_en = MarianMTModel.from_pretrained(TA_EN_MODEL_ID).to(DEVICE)
+        
+        # English -> Tamil (English -> Dravidian)
+        EN_TA_MODEL_ID = "Helsinki-NLP/opus-mt-en-dra"
+        tokenizer_en_ta = MarianTokenizer.from_pretrained(EN_TA_MODEL_ID)
+        model_en_ta = MarianMTModel.from_pretrained(EN_TA_MODEL_ID).to(DEVICE)
+        print("✅ NMT Models loaded from Hugging Face Hub.")
+    except Exception as e2:
+         print(f"❌ Error loading NMT models from Hub: {e2}")
+         raise e2
 
 
 # ==========================================
@@ -110,7 +125,40 @@ def translate_offline(text, direction="ta_en"):
         return tokenizer_en_ta.batch_decode(output, skip_special_tokens=True)[0]
 
 
-def predict_tamil_bigru(text, top_k=3):
+def filter_predictions_by_prefix(predictions, prefix, top_k=3):
+    """
+    Filter predictions to only include words starting with the given prefix.
+    Used for AAC-style prefix-based word completion.
+    
+    Args:
+        predictions: List of {"word": str, "confidence": float} dicts
+        prefix: String prefix to filter by (case-insensitive)
+        top_k: Number of results to return
+    
+    Returns:
+        Filtered list of top_k predictions matching prefix
+    """
+    if not prefix or not prefix.strip():
+        # No prefix, return top predictions as-is
+        return predictions[:top_k]
+    
+    prefix_lower = prefix.lower().strip()
+    
+    # Filter predictions that start with the prefix
+    filtered = [
+        p for p in predictions 
+        if p.get('word', '').lower().startswith(prefix_lower)
+    ]
+    
+    # Return top_k filtered results
+    return filtered[:top_k]
+
+
+def predict_tamil_bigru(text, top_k=30):
+    """
+    Predict next Tamil words using Bi-GRU model.
+    Returns more candidates (top_k=30) to allow for prefix filtering.
+    """
     tokens = text.strip().split()
     encoded = [ta_word2idx.get(w, ta_word2idx.get(UNK, 0)) for w in tokens]
     # Pad sequences
@@ -119,7 +167,7 @@ def predict_tamil_bigru(text, top_k=3):
     # Predict
     probs = bi_gru_model.predict(padded, verbose=0)[0]
     
-    # Get Top-K
+    # Get Top-K (increased to allow filtering)
     top_idx = np.argsort(probs)[-top_k:][::-1]
     
     results = []
@@ -128,11 +176,15 @@ def predict_tamil_bigru(text, top_k=3):
         confidence = float(probs[i])
         results.append({"word": word, "confidence": confidence})
         
-    top1_prob = float(probs[top_idx[0]])
+    top1_prob = float(probs[top_idx[0]]) if len(top_idx) > 0 else 0.0
     return results, top1_prob
 
 
-def predict_english(model, tokenizer, text, top_k=3):
+def predict_english(model, tokenizer, text, top_k=30):
+    """
+    Predict next English words using LSTM/BiLSTM model.
+    Returns more candidates (top_k=30) to allow for prefix filtering.
+    """
     if not text or not text.strip():
         return [], 0.0
 
@@ -162,9 +214,14 @@ def translation_pipeline_predict(text_ta, model, tokenizer, top_k=3):
         # 2. Predict next English words
         en_preds, top1_prob = predict_english(model, tokenizer, text_en, top_k)
         
+        
         # 3. English -> Tamil (Back translate predictions)
         ta_preds = []
-        for en_word, prob in en_preds:
+        for item in en_preds:
+            # en_preds is a list of dicts: {"word": "...", "confidence": ...}
+            en_word = item["word"]
+            prob = item["confidence"]
+            
             ta_word = translate_offline(en_word, direction="en_ta")
             ta_preds.append({"word": ta_word, "confidence": prob})
             
@@ -294,10 +351,15 @@ def calculate_validity_score(predictions, current_sentence, language="ta"):
     return (valid_count / len(predictions)) * 100
 
 
-def get_predictions(current_sentence, language="ta"):
+def get_predictions(current_sentence, language="ta", partial_word=""):
     """
     Main entry point for API.
     Returns dictionary with predictions for all 3 models.
+    
+    Args:
+        current_sentence: The complete sentence context
+        language: "ta" for Tamil or "en" for English
+        partial_word: The word currently being typed (for prefix filtering)
     """
     response = {}
     
@@ -310,20 +372,11 @@ def get_predictions(current_sentence, language="ta"):
         # 2. LSTM (Direct English)
         try:
             preds, conf = predict_english(lstm_model, en_tokenizer_lstm, current_sentence)
-            # English Validity Check
-            # For now, reusing calculate_validity_score which applies Tamil rules. 
-            # We need English rules. But for Step 1, let's just get predictions.
-            # TODO: Implement english specific validity if needed or adapt existing one.
-            # The user asked for "Graph 2 — Grammatical Validity Rate ... Rule-based English grammar checks"
-            # We will use a modified validity checker or just existing one if it's generic enough (it isn't).
-            # For now, let's map it to 0 or implement basic English validity.
-            # Let's add a simple English validity check helper or update the existing one.
-            # Actually, let's just use the calculate_validity_score but we need to ensure it doesn't fail.
-            # The current is_grammatically_valid is heavily Tamil specific.
-            # We should probably pass language to calculate_validity_score too.
-            validity = calculate_validity_score(preds, current_sentence, language="en")
+            # Apply prefix filtering
+            filtered_preds = filter_predictions_by_prefix(preds, partial_word, top_k=3)
+            validity = calculate_validity_score(filtered_preds, current_sentence, language="en")
             response["lstm"] = {
-                "predictions": preds,
+                "predictions": filtered_preds,
                 "top1_confidence": conf,
                 "validity_score": validity
             }
@@ -334,9 +387,11 @@ def get_predictions(current_sentence, language="ta"):
         # 3. BiLSTM (Direct English)
         try:
             preds, conf = predict_english(bilstm_model, en_tokenizer_bilstm, current_sentence)
-            validity = calculate_validity_score(preds, current_sentence, language="en")
+            # Apply prefix filtering
+            filtered_preds = filter_predictions_by_prefix(preds, partial_word, top_k=3)
+            validity = calculate_validity_score(filtered_preds, current_sentence, language="en")
             response["bilstm"] = {
-                "predictions": preds,
+                "predictions": filtered_preds,
                 "top1_confidence": conf,
                 "validity_score": validity
             }
@@ -350,9 +405,11 @@ def get_predictions(current_sentence, language="ta"):
         # 1. Direct Tamil Bi-GRU
         try:
             preds, conf = predict_tamil_bigru(current_sentence)
-            validity = calculate_validity_score(preds, current_sentence, language="ta")
+            # Apply prefix filtering
+            filtered_preds = filter_predictions_by_prefix(preds, partial_word, top_k=3)
+            validity = calculate_validity_score(filtered_preds, current_sentence, language="ta")
             response["bi_gru"] = {
-                "predictions": preds,
+                "predictions": filtered_preds,
                 "top1_confidence": conf,
                 "validity_score": validity
             }
@@ -363,9 +420,11 @@ def get_predictions(current_sentence, language="ta"):
         # 2. LSTM Baseline
         try:
             preds, conf = translation_pipeline_predict(current_sentence, lstm_model, en_tokenizer_lstm)
-            validity = calculate_validity_score(preds, current_sentence, language="ta")
+            # Apply prefix filtering
+            filtered_preds = filter_predictions_by_prefix(preds, partial_word, top_k=3)
+            validity = calculate_validity_score(filtered_preds, current_sentence, language="ta")
             response["lstm"] = {
-                "predictions": preds,
+                "predictions": filtered_preds,
                 "top1_confidence": conf,
                 "validity_score": validity
             }
@@ -376,9 +435,11 @@ def get_predictions(current_sentence, language="ta"):
         # 3. BiLSTM Model
         try:
             preds, conf = translation_pipeline_predict(current_sentence, bilstm_model, en_tokenizer_bilstm)
-            validity = calculate_validity_score(preds, current_sentence, language="ta")
+            # Apply prefix filtering
+            filtered_preds = filter_predictions_by_prefix(preds, partial_word, top_k=3)
+            validity = calculate_validity_score(filtered_preds, current_sentence, language="ta")
             response["bilstm"] = {
-                "predictions": preds,
+                "predictions": filtered_preds,
                 "top1_confidence": conf,
                 "validity_score": validity
             }

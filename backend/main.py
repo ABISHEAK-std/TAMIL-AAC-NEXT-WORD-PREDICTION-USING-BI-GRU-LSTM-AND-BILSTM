@@ -18,6 +18,7 @@ app.add_middleware(
 class PredictionRequest(BaseModel):
     current_sentence: str
     language: str = "ta"
+    partial_word: str = ""  # The word currently being typed (after last space)
 
 @app.get("/")
 def health_check():
@@ -29,11 +30,12 @@ async def predict(request: PredictionRequest):
     
     sentence = request.current_sentence
     language = request.language
-    print(f"Received prediction request for: {sentence} (Language: {language})")
+    partial_word = request.partial_word
+    print(f"Received prediction request for: {sentence} (Language: {language}, Partial: '{partial_word}')")
     
     try:
         # Run inference
-        results = get_predictions(sentence, language)
+        results = get_predictions(sentence, language, partial_word)
         
         # Calculate total latency
         latency_ms = round((time.time() - start_time) * 1000, 2)
